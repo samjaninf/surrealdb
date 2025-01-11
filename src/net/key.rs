@@ -1,4 +1,6 @@
-use crate::dbs::DB;
+use super::headers::Accept;
+use super::AppState;
+use crate::cnf::HTTP_MAX_KEY_BODY_SIZE;
 use crate::err::Error;
 use crate::net::input::bytes_to_utf8;
 use crate::net::output;
@@ -6,19 +8,18 @@ use crate::net::params::Params;
 use axum::extract::{DefaultBodyLimit, Path};
 use axum::response::IntoResponse;
 use axum::routing::options;
-use axum::{Extension, Router, TypedHeader};
+use axum::Extension;
+use axum::Router;
 use axum_extra::extract::Query;
+use axum_extra::TypedHeader;
 use bytes::Bytes;
-use http_body::Body as HttpBody;
 use serde::Deserialize;
 use std::str;
+use surrealdb::dbs::capabilities::RouteTarget;
 use surrealdb::dbs::Session;
+use surrealdb::iam::check::check_ns_db;
 use surrealdb::sql::Value;
 use tower_http::limit::RequestBodyLimitLayer;
-
-use super::headers::Accept;
-
-const MAX: usize = 1024 * 16; // 16 KiB
 
 #[derive(Default, Deserialize, Debug, Clone)]
 struct QueryOptions {
@@ -27,11 +28,8 @@ struct QueryOptions {
 	pub fields: Option<Vec<String>>,
 }
 
-pub(super) fn router<S, B>() -> Router<S, B>
+pub(super) fn router<S>() -> Router<S>
 where
-	B: HttpBody + Send + 'static,
-	B::Data: Send,
-	B::Error: std::error::Error + Send + Sync + 'static,
 	S: Clone + Send + Sync + 'static,
 {
 	Router::new()
@@ -45,7 +43,7 @@ where
 				.delete(delete_all),
 		)
 		.route_layer(DefaultBodyLimit::disable())
-		.layer(RequestBodyLimitLayer::new(MAX))
+		.layer(RequestBodyLimitLayer::new(*HTTP_MAX_KEY_BODY_SIZE))
 		.merge(
 			Router::new()
 				.route(
@@ -58,7 +56,7 @@ where
 						.delete(delete_one),
 				)
 				.route_layer(DefaultBodyLimit::disable())
-				.layer(RequestBodyLimitLayer::new(MAX)),
+				.layer(RequestBodyLimitLayer::new(*HTTP_MAX_KEY_BODY_SIZE)),
 		)
 }
 
@@ -67,13 +65,21 @@ where
 // ------------------------------
 
 async fn select_all(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path(table): Path<String>,
 	Query(query): Query<QueryOptions>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Specify the request statement
 	let sql = match query.fields {
 		None => "SELECT * FROM type::table($table) LIMIT $limit START $start",
@@ -88,12 +94,13 @@ async fn select_all(
 	};
 	// Execute the query and return the result
 	match db.execute(sql, &session, Some(vars)).await {
-		Ok(res) => match maybe_output.as_deref() {
+		Ok(res) => match accept.as_deref() {
 			// Simple serialization
 			Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
 			Some(Accept::ApplicationPack) => Ok(output::pack(&output::simplify(res))),
 			// Internal serialization
+			// TODO: remove format in 2.0.0
 			Some(Accept::Surrealdb) => Ok(output::full(&res)),
 			// An incorrect content-type was requested
 			_ => Err(Error::InvalidType),
@@ -104,14 +111,22 @@ async fn select_all(
 }
 
 async fn create_all(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path(table): Path<String>,
 	Query(params): Query<Params>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the request body as JSON
@@ -127,7 +142,7 @@ async fn create_all(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -146,14 +161,22 @@ async fn create_all(
 }
 
 async fn update_all(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path(table): Path<String>,
 	Query(params): Query<Params>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the request body as JSON
@@ -169,7 +192,7 @@ async fn update_all(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -188,14 +211,22 @@ async fn update_all(
 }
 
 async fn modify_all(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path(table): Path<String>,
 	Query(params): Query<Params>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the request body as JSON
@@ -211,7 +242,7 @@ async fn modify_all(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -230,13 +261,21 @@ async fn modify_all(
 }
 
 async fn delete_all(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path(table): Path<String>,
 	Query(params): Query<Params>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Specify the request statement
 	let sql = "DELETE type::table($table) RETURN BEFORE";
 	// Specify the request variables
@@ -246,7 +285,7 @@ async fn delete_all(
 	};
 	// Execute the query and return the result
 	match db.execute(sql, &session, Some(vars)).await {
-		Ok(res) => match maybe_output.as_deref() {
+		Ok(res) => match accept.as_deref() {
 			// Simple serialization
 			Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -266,13 +305,21 @@ async fn delete_all(
 // ------------------------------
 
 async fn select_one(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path((table, id)): Path<(String, String)>,
 	Query(query): Query<QueryOptions>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Specify the request statement
 	let sql = match query.fields {
 		None => "SELECT * FROM type::thing($table, $id)",
@@ -291,7 +338,7 @@ async fn select_one(
 	};
 	// Execute the query and return the result
 	match db.execute(sql, &session, Some(vars)).await {
-		Ok(res) => match maybe_output.as_deref() {
+		Ok(res) => match accept.as_deref() {
 			// Simple serialization
 			Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -307,14 +354,22 @@ async fn select_one(
 }
 
 async fn create_one(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Query(params): Query<Params>,
 	Path((table, id)): Path<(String, String)>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the Record ID as a SurrealQL value
@@ -336,7 +391,7 @@ async fn create_one(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -355,14 +410,22 @@ async fn create_one(
 }
 
 async fn update_one(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Query(params): Query<Params>,
 	Path((table, id)): Path<(String, String)>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the Record ID as a SurrealQL value
@@ -374,7 +437,7 @@ async fn update_one(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::thing($table, $id) CONTENT $data";
+			let sql = "UPSERT type::thing($table, $id) CONTENT $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),
@@ -384,7 +447,7 @@ async fn update_one(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -403,14 +466,22 @@ async fn update_one(
 }
 
 async fn modify_one(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Query(params): Query<Params>,
 	Path((table, id)): Path<(String, String)>,
 	body: Bytes,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Convert the HTTP request body
 	let data = bytes_to_utf8(&body)?;
 	// Parse the Record ID as a SurrealQL value
@@ -422,7 +493,7 @@ async fn modify_one(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::thing($table, $id) MERGE $data";
+			let sql = "UPSERT type::thing($table, $id) MERGE $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),
@@ -432,7 +503,7 @@ async fn modify_one(
 			};
 			// Execute the query and return the result
 			match db.execute(sql, &session, Some(vars)).await {
-				Ok(res) => match maybe_output.as_deref() {
+				Ok(res) => match accept.as_deref() {
 					// Simple serialization
 					Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 					Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
@@ -451,12 +522,20 @@ async fn modify_one(
 }
 
 async fn delete_one(
+	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	maybe_output: Option<TypedHeader<Accept>>,
+	accept: Option<TypedHeader<Accept>>,
 	Path((table, id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Key) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Key);
+		return Err(Error::ForbiddenRoute(RouteTarget::Key.to_string()));
+	}
+	// Ensure a NS and DB are set
+	let _ = check_ns_db(&session)?;
 	// Specify the request statement
 	let sql = "DELETE type::thing($table, $id) RETURN BEFORE";
 	// Parse the Record ID as a SurrealQL value
@@ -471,7 +550,7 @@ async fn delete_one(
 	};
 	// Execute the query and return the result
 	match db.execute(sql, &session, Some(vars)).await {
-		Ok(res) => match maybe_output.as_deref() {
+		Ok(res) => match accept.as_deref() {
 			// Simple serialization
 			Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
 			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),

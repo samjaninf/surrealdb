@@ -1,63 +1,18 @@
-use crate::err;
+use crate::rpc::failure::Failure;
+use crate::rpc::format::WsFormat;
 use crate::telemetry::metrics::ws::record_rpc;
 use axum::extract::ws::Message;
 use opentelemetry::Context as TelemetryContext;
+use revision::revisioned;
 use serde::Serialize;
-use serde_json::{json, Value as Json};
-use std::borrow::Cow;
+use std::sync::Arc;
 use surrealdb::channel::Sender;
-use surrealdb::dbs;
-use surrealdb::dbs::Notification;
-use surrealdb::sql;
+use surrealdb::rpc::format::Format;
+use surrealdb::rpc::Data;
 use surrealdb::sql::Value;
 use tracing::Span;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum OutputFormat {
-	Json, // JSON
-	Cbor, // CBOR
-	Pack, // MessagePack
-	Full, // Full type serialization
-}
-
-/// The data returned by the database
-// The variants here should be in exactly the same order as `surrealdb::engine::remote::ws::Data`
-// In future, they will possibly be merged to avoid having to keep them in sync.
-#[derive(Debug, Serialize)]
-pub enum Data {
-	/// Generally methods return a `sql::Value`
-	Other(Value),
-	/// The query methods, `query` and `query_with` return a `Vec` of responses
-	Query(Vec<dbs::Response>),
-	/// Live queries return a notification
-	Live(Notification),
-	// Add new variants here
-}
-
-impl From<Value> for Data {
-	fn from(v: Value) -> Self {
-		Data::Other(v)
-	}
-}
-
-impl From<String> for Data {
-	fn from(v: String) -> Self {
-		Data::Other(Value::from(v))
-	}
-}
-
-impl From<Vec<dbs::Response>> for Data {
-	fn from(v: Vec<dbs::Response>) -> Self {
-		Data::Query(v)
-	}
-}
-
-impl From<Notification> for Data {
-	fn from(n: Notification) -> Self {
-		Data::Live(n)
-	}
-}
-
+#[revisioned(revision = 1)]
 #[derive(Debug, Serialize)]
 pub struct Response {
 	id: Option<Value>,
@@ -65,38 +20,27 @@ pub struct Response {
 }
 
 impl Response {
-	/// Convert and simplify the value into JSON
 	#[inline]
-	fn simplify(self) -> Json {
+	pub fn into_value(self) -> Value {
 		let mut value = match self.result {
-			Ok(data) => {
-				let value = match data {
-					Data::Query(vec) => {
-						let responses: Vec<_> =
-							vec.into_iter().map(dbs::ApiResponse::from).collect();
-						sql::to_value(responses).unwrap()
-					}
-					Data::Live(notification) => sql::to_value(notification).unwrap(),
-					Data::Other(value) => value,
-				};
-				json!({
-					"result": Json::from(value),
-				})
-			}
-			Err(failure) => json!({
-				"error": failure,
-			}),
+			Ok(val) => map! {
+				"result" => Value::from(val),
+			},
+			Err(err) => map! {
+				"error" => Value::from(err),
+			},
 		};
 		if let Some(id) = self.id {
-			value["id"] = id.into();
+			value.insert("id", id);
 		}
-		value
+		value.into()
 	}
 
 	/// Send the response to the WebSocket channel
-	pub async fn send(self, out: OutputFormat, chn: &Sender<Message>) {
+	pub async fn send(self, cx: Arc<TelemetryContext>, fmt: Format, chn: &Sender<Message>) {
+		// Create a new tracing span
 		let span = Span::current();
-
+		// Log the rpc response call
 		debug!("Process RPC response");
 
 		let is_error = self.result.is_err();
@@ -109,73 +53,26 @@ impl Response {
 			span.record("rpc.error_code", err.code);
 			span.record("rpc.error_message", err.message.as_ref());
 		}
-
-		let (res_size, message) = match out {
-			OutputFormat::Json => {
-				let res = serde_json::to_string(&self.simplify()).unwrap();
-				(res.len(), Message::Text(res))
-			}
-			OutputFormat::Cbor => {
-				let res = serde_cbor::to_vec(&self.simplify()).unwrap();
-				(res.len(), Message::Binary(res))
-			}
-			OutputFormat::Pack => {
-				let res = serde_pack::to_vec(&self.simplify()).unwrap();
-				(res.len(), Message::Binary(res))
-			}
-			OutputFormat::Full => {
-				let res = surrealdb::sql::serde::serialize(&self).unwrap();
-				(res.len(), Message::Binary(res))
+		// Cheaper to clone the id in case of a failure
+		// than to clone the entire response, which can be arbitrary size
+		let id = self.id.clone();
+		// Process the response for the format
+		let (len, msg) = match fmt.res_ws(self) {
+			Ok((l, m)) => (l, m),
+			Err(err) => {
+				fmt.res_ws(failure(id, err)).expect("Serialising known thrown error should succeed")
 			}
 		};
-
-		if chn.send(message).await.is_ok() {
-			record_rpc(&TelemetryContext::current(), res_size, is_error);
+		// Send the message to the write channel
+		if chn.send(msg).await.is_ok() {
+			record_rpc(cx.as_ref(), len, is_error);
 		};
 	}
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Failure {
-	code: i64,
-	message: Cow<'static, str>,
-}
-
-#[allow(dead_code)]
-impl Failure {
-	pub const PARSE_ERROR: Failure = Failure {
-		code: -32700,
-		message: Cow::Borrowed("Parse error"),
-	};
-
-	pub const INVALID_REQUEST: Failure = Failure {
-		code: -32600,
-		message: Cow::Borrowed("Invalid Request"),
-	};
-
-	pub const METHOD_NOT_FOUND: Failure = Failure {
-		code: -32601,
-		message: Cow::Borrowed("Method not found"),
-	};
-
-	pub const INVALID_PARAMS: Failure = Failure {
-		code: -32602,
-		message: Cow::Borrowed("Invalid params"),
-	};
-
-	pub const INTERNAL_ERROR: Failure = Failure {
-		code: -32603,
-		message: Cow::Borrowed("Internal error"),
-	};
-
-	pub fn custom<S>(message: S) -> Failure
-	where
-		Cow<'static, str>: From<S>,
-	{
-		Failure {
-			code: -32000,
-			message: message.into(),
-		}
+impl From<Response> for Value {
+	fn from(value: Response) -> Self {
+		value.into_value()
 	}
 }
 
@@ -192,12 +89,6 @@ pub fn failure(id: Option<Value>, err: Failure) -> Response {
 	Response {
 		id,
 		result: Err(err),
-	}
-}
-
-impl From<err::Error> for Failure {
-	fn from(err: err::Error) -> Self {
-		Failure::custom(err.to_string())
 	}
 }
 

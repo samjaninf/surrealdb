@@ -4,7 +4,7 @@
   inherit target;
 
   features = with util.features;
-    [ default storage-tikv ]
+    [ storage-mem storage-rocksdb scripting http storage-tikv ]
     ++ pkgs.lib.lists.optional (util.fdbSupported pkgs.fdbPackages)
     [ storage-fdb ];
 
@@ -16,7 +16,7 @@
 
       nativeBuildInputs = [ pkg-config ];
 
-      buildInputs = [ openssl ]
+      buildInputs = [ openssl onnxruntime ]
         ++ lib.lists.optional (util.fdbSupported fdbPackages)
         (util.fdbPackage fdbPackages);
 
@@ -26,5 +26,7 @@
       PROTOC_INCLUDE = "${protobuf}/include";
 
       CARGO_BUILD_TARGET = target;
+
+      ONNXRUNTIME_LIB_PATH = "${onnxruntime.outPath}/lib/libonnxruntime.so";
     };
 }
