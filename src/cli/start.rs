@@ -1,20 +1,18 @@
-use super::config;
-use super::config::Config;
-use crate::cli::validator::parser::env_filter::CustomEnvFilter;
-use crate::cli::validator::parser::env_filter::CustomEnvFilterParser;
+use super::config::{Config, CF};
 use crate::cnf::LOGO;
 use crate::dbs;
 use crate::dbs::StartCommandDbsOptions;
 use crate::env;
 use crate::err::Error;
 use crate::net::{self, client_ip::ClientIp};
-use crate::node;
 use clap::Args;
-use opentelemetry::Context as TelemetryContext;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use surrealdb::engine::any::IntoEndpoint;
+use surrealdb::engine::tasks;
+use surrealdb::options::EngineOptions;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Args, Debug)]
@@ -24,11 +22,6 @@ pub struct StartCommandArguments {
 	#[arg(default_value = "memory")]
 	#[arg(value_parser = super::validator::path_valid)]
 	path: String,
-	#[arg(help = "The logging level for the database server")]
-	#[arg(env = "SURREAL_LOG", short = 'l', long = "log")]
-	#[arg(default_value = "info")]
-	#[arg(value_parser = CustomEnvFilterParser::new())]
-	log: CustomEnvFilter,
 	#[arg(help = "Whether to hide the startup banner")]
 	#[arg(env = "SURREAL_NO_BANNER", long)]
 	#[arg(default_value_t = false)]
@@ -38,15 +31,37 @@ pub struct StartCommandArguments {
 	#[arg(value_parser = super::validator::key_valid)]
 	#[arg(hide = true)] // Not currently in use
 	key: Option<String>,
-
+	//
+	// Tasks
+	//
 	#[arg(
-		help = "The interval at which to run node agent tick (including garbage collection)",
+		help = "The interval at which to refresh node registration information",
 		help_heading = "Database"
 	)]
-	#[arg(env = "SURREAL_TICK_INTERVAL", long = "tick-interval", value_parser = super::validator::duration)]
+	#[arg(env = "SURREAL_NODE_MEMBERSHIP_REFRESH_INTERVAL", long = "node-membership-refresh-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "3s")]
+	node_membership_refresh_interval: Duration,
+	#[arg(
+		help = "The interval at which process and archive inactive nodes",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_NODE_MEMBERSHIP_CHECK_INTERVAL", long = "node-membership-check-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "15s")]
+	node_membership_check_interval: Duration,
+	#[arg(
+		help = "The interval at which to process and cleanup archived nodes",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_NODE_MEMBERSHIP_CLEANUP_INTERVAL", long = "node-membership-cleanup-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "300s")]
+	node_membership_cleanup_interval: Duration,
+	#[arg(
+		help = "The interval at which to perform changefeed garbage collection",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_CHANGEFEED_GC_INTERVAL", long = "changefeed-gc-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "10s")]
-	tick_interval: Duration,
-
+	changefeed_gc_interval: Duration,
 	//
 	// Authentication
 	//
@@ -74,14 +89,12 @@ pub struct StartCommandArguments {
 		requires = "username"
 	)]
 	password: Option<String>,
-
 	//
 	// Datastore connection
 	//
 	#[command(next_help_heading = "Datastore connection")]
 	#[command(flatten)]
 	kvs: Option<StartCommandRemoteTlsOptions>,
-
 	//
 	// HTTP Server
 	//
@@ -92,11 +105,14 @@ pub struct StartCommandArguments {
 	#[arg(env = "SURREAL_CLIENT_IP", long)]
 	#[arg(default_value = "socket", value_enum)]
 	client_ip: ClientIp,
-	#[arg(help = "The hostname or ip address to listen for connections on")]
+	#[arg(help = "The hostname or IP address to listen for connections on")]
 	#[arg(env = "SURREAL_BIND", short = 'b', long = "bind")]
-	#[arg(default_value = "0.0.0.0:8000")]
+	#[arg(default_value = "127.0.0.1:8000")]
 	listen_addresses: Vec<SocketAddr>,
-
+	#[arg(help = "Whether to suppress the server name and version headers")]
+	#[arg(env = "SURREAL_NO_IDENTIFICATION_HEADERS", long)]
+	#[arg(default_value_t = false)]
+	no_identification_headers: bool,
 	//
 	// Database options
 	//
@@ -139,21 +155,17 @@ pub async fn init(
 		listen_addresses,
 		dbs,
 		web,
-		log,
-		tick_interval,
+		node_membership_refresh_interval,
+		node_membership_check_interval,
+		node_membership_cleanup_interval,
+		changefeed_gc_interval,
 		no_banner,
+		no_identification_headers,
 		..
 	}: StartCommandArguments,
 ) -> Result<(), Error> {
-	// Initialize opentelemetry and logging
-	crate::telemetry::builder().with_filter(log).init();
-	// Start metrics subsystem
-	crate::telemetry::metrics::init(&TelemetryContext::current())
-		.expect("failed to initialize metrics");
-
-	// Check if a banner should be outputted
+	// Check if we should output a banner
 	if !no_banner {
-		// Output SurrealDB logo
 		println!("{LOGO}");
 	}
 	// Clean the path
@@ -163,35 +175,48 @@ pub async fn init(
 	} else {
 		endpoint.path
 	};
-	// Setup the cli options
-	let _ = config::CF.set(Config {
+	// Extract the certificate and key
+	let (crt, key) = if let Some(val) = web {
+		(val.web_crt, val.web_key)
+	} else {
+		(None, None)
+	};
+	// Configure the engine
+	let engine = EngineOptions::default()
+		.with_node_membership_refresh_interval(node_membership_refresh_interval)
+		.with_node_membership_check_interval(node_membership_check_interval)
+		.with_node_membership_cleanup_interval(node_membership_cleanup_interval)
+		.with_changefeed_gc_interval(changefeed_gc_interval);
+	// Configure the config
+	let config = Config {
 		bind: listen_addresses.first().cloned().unwrap(),
 		client_ip,
 		path,
 		user,
 		pass,
-		tick_interval,
-		crt: web.as_ref().and_then(|x| x.web_crt.clone()),
-		key: web.as_ref().and_then(|x| x.web_key.clone()),
-	});
-	// This is the cancellation token propagated down to
-	// all the async functions that needs to be stopped gracefully.
-	let ct = CancellationToken::new();
+		no_identification_headers,
+		engine,
+		crt,
+		key,
+	};
+	// Setup the command-line options
+	let _ = CF.set(config);
 	// Initiate environment
 	env::init().await?;
-	// Start the kvs server
-	dbs::init(dbs).await?;
+	// Create a token to cancel tasks
+	let canceller = CancellationToken::new();
+	// Start the datastore
+	let datastore = Arc::new(dbs::init(dbs).await?);
 	// Start the node agent
-	#[cfg(feature = "has-storage")]
-	let nd = node::init(ct.clone());
+	let nodetasks = tasks::init(datastore.clone(), canceller.clone(), &CF.get().unwrap().engine);
 	// Start the web server
-	net::init(ct).await?;
-	// Wait for the node agent to stop
-	#[cfg(feature = "has-storage")]
-	if let Err(e) = nd.await {
-		error!("Node agent failed while running: {}", e);
-		return Err(Error::NodeAgent);
-	}
+	net::init(datastore.clone(), canceller.clone()).await?;
+	// Shutdown and stop closed tasks
+	canceller.cancel();
+	// Wait for background tasks to finish
+	nodetasks.resolve().await?;
+	// Shutdown the datastore
+	datastore.shutdown().await?;
 	// All ok
 	Ok(())
 }

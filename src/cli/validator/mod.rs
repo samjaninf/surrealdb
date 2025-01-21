@@ -1,38 +1,52 @@
 use std::collections::HashSet;
-#[cfg(feature = "has-storage")]
 use std::{
 	path::{Path, PathBuf},
 	str::FromStr,
 	time::Duration,
 };
 
-use surrealdb::dbs::capabilities::{FuncTarget, NetTarget, Targets};
+use surrealdb::dbs::capabilities::{
+	ExperimentalTarget, FuncTarget, MethodTarget, NetTarget, RouteTarget, Targets,
+};
 
 pub(crate) mod parser;
 
-#[cfg(feature = "has-storage")]
 pub(crate) fn path_valid(v: &str) -> Result<String, String> {
 	match v {
 		"memory" => Ok(v.to_string()),
 		v if v.starts_with("file:") => Ok(v.to_string()),
 		v if v.starts_with("rocksdb:") => Ok(v.to_string()),
-		v if v.starts_with("speedb:") => Ok(v.to_string()),
+		v if v.starts_with("surrealkv:") => Ok(v.to_string()),
+		v if v.starts_with("surrealkv+versioned:") => Ok(v.to_string()),
+		v if v.starts_with("surrealcs:") => Ok(v.to_string()),
 		v if v.starts_with("tikv:") => Ok(v.to_string()),
 		v if v.starts_with("fdb:") => Ok(v.to_string()),
 		_ => Err(String::from("Provide a valid database path parameter")),
 	}
 }
 
-#[cfg(feature = "has-storage")]
-pub(crate) fn file_exists(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn path_exists(path: &str) -> Result<PathBuf, String> {
 	let path = Path::new(path);
 	if !*path.try_exists().as_ref().map_err(ToString::to_string)? {
-		return Err(String::from("Ensure the file exists"));
+		return Err(String::from("Ensure the path exists"));
 	}
+	Ok(path.to_owned())
+}
+
+pub(crate) fn file_exists(path: &str) -> Result<PathBuf, String> {
+	let path = path_exists(path)?;
 	if !path.is_file() {
 		return Err(String::from("Ensure the path is a file"));
 	}
-	Ok(path.to_owned())
+	Ok(path)
+}
+
+pub(crate) fn dir_exists(path: &str) -> Result<PathBuf, String> {
+	let path = path_exists(path)?;
+	if !path.is_dir() {
+		return Err(String::from("Ensure the path is a directory"));
+	}
+	Ok(path)
 }
 
 pub(crate) fn endpoint_valid(v: &str) -> Result<String, String> {
@@ -48,24 +62,22 @@ pub(crate) fn endpoint_valid(v: &str) -> Result<String, String> {
 
 	let scheme = split_endpoint(v).0;
 	match scheme {
-		"http" | "https" | "ws" | "wss" | "fdb" | "mem" | "rocksdb" | "file" | "tikv" => {
-			Ok(v.to_string())
-		}
+		"http"
+		| "https"
+		| "ws"
+		| "wss"
+		| "fdb"
+		| "mem"
+		| "rocksdb"
+		| "surrealkv"
+		| "surrealkv+versioned"
+		| "file"
+		| "surrealcs"
+		| "tikv" => Ok(v.to_string()),
 		_ => Err(String::from("Provide a valid database connection string")),
 	}
 }
 
-pub(crate) fn into_valid(v: &str) -> Result<String, String> {
-	match v {
-		v if v.ends_with(".db") => Ok(v.to_string()),
-		v if v.starts_with("http://") => Ok(v.to_string()),
-		v if v.starts_with("https://") => Ok(v.to_string()),
-		"-" => Ok(v.to_string()),
-		_ => Err(String::from("Provide a valid database connection string, or the path to a file")),
-	}
-}
-
-#[cfg(feature = "has-storage")]
 pub(crate) fn key_valid(v: &str) -> Result<String, String> {
 	match v.len() {
 		16 => Ok(v.to_string()),
@@ -75,7 +87,6 @@ pub(crate) fn key_valid(v: &str) -> Result<String, String> {
 	}
 }
 
-#[cfg(feature = "has-storage")]
 pub(crate) fn duration(v: &str) -> Result<Duration, String> {
 	surrealdb::sql::Duration::from_str(v).map(|d| d.0).map_err(|_| String::from("invalid duration"))
 }
@@ -88,7 +99,7 @@ pub(crate) fn net_targets(value: &str) -> Result<Targets<NetTarget>, String> {
 	let mut result = HashSet::new();
 
 	for target in value.split(',').filter(|s| !s.is_empty()) {
-		result.insert(NetTarget::from_str(target)?);
+		result.insert(NetTarget::from_str(target).map_err(|e| e.to_string())?);
 	}
 
 	Ok(Targets::Some(result))
@@ -102,7 +113,49 @@ pub(crate) fn func_targets(value: &str) -> Result<Targets<FuncTarget>, String> {
 	let mut result = HashSet::new();
 
 	for target in value.split(',').filter(|s| !s.is_empty()) {
-		result.insert(FuncTarget::from_str(target)?);
+		result.insert(FuncTarget::from_str(target).map_err(|e| e.to_string())?);
+	}
+
+	Ok(Targets::Some(result))
+}
+
+pub(crate) fn experimental_targets(value: &str) -> Result<Targets<ExperimentalTarget>, String> {
+	if ["*", ""].contains(&value) {
+		return Ok(Targets::All);
+	}
+
+	let mut result = HashSet::new();
+
+	for target in value.split(',').filter(|s| !s.is_empty()) {
+		result.insert(ExperimentalTarget::from_str(target).map_err(|e| e.to_string())?);
+	}
+
+	Ok(Targets::Some(result))
+}
+
+pub(crate) fn method_targets(value: &str) -> Result<Targets<MethodTarget>, String> {
+	if ["*", ""].contains(&value) {
+		return Ok(Targets::All);
+	}
+
+	let mut result = HashSet::new();
+
+	for target in value.split(',').filter(|s| !s.is_empty()) {
+		result.insert(MethodTarget::from_str(target).map_err(|e| e.to_string())?);
+	}
+
+	Ok(Targets::Some(result))
+}
+
+pub(crate) fn route_targets(value: &str) -> Result<Targets<RouteTarget>, String> {
+	if ["*", ""].contains(&value) {
+		return Ok(Targets::All);
+	}
+
+	let mut result = HashSet::new();
+
+	for target in value.split(',').filter(|s| !s.is_empty()) {
+		result.insert(RouteTarget::from_str(target).map_err(|e| e.to_string())?);
 	}
 
 	Ok(Targets::Some(result))
@@ -151,5 +204,39 @@ mod tests {
 
 		assert!(net_targets("127777.0.0.1").is_err());
 		assert!(net_targets("127.0.0.1,127777.0.0.1").is_err());
+	}
+
+	#[test]
+	fn test_method_targets() {
+		assert_eq!(method_targets("*").unwrap(), Targets::<MethodTarget>::All);
+		assert_eq!(method_targets("").unwrap(), Targets::<MethodTarget>::All);
+		assert_eq!(
+			method_targets("query").unwrap(),
+			Targets::<MethodTarget>::Some(vec!["query".parse().unwrap()].into_iter().collect())
+		);
+		assert_eq!(
+			method_targets("query,authenticate").unwrap(),
+			Targets::<MethodTarget>::Some(
+				vec!["query".parse().unwrap(), "authenticate".parse().unwrap()]
+					.into_iter()
+					.collect()
+			)
+		);
+	}
+
+	#[test]
+	fn test_route_targets() {
+		assert_eq!(route_targets("*").unwrap(), Targets::<RouteTarget>::All);
+		assert_eq!(route_targets("").unwrap(), Targets::<RouteTarget>::All);
+		assert_eq!(
+			route_targets("key").unwrap(),
+			Targets::<RouteTarget>::Some(vec!["key".parse().unwrap()].into_iter().collect())
+		);
+		assert_eq!(
+			route_targets("key,sql").unwrap(),
+			Targets::<RouteTarget>::Some(
+				vec!["key".parse().unwrap(), "sql".parse().unwrap()].into_iter().collect()
+			)
+		);
 	}
 }
